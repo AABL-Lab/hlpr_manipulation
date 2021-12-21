@@ -1,0 +1,11 @@
+# Action definition for doing small movements in eef space
+#
+# form of goal taken in
+geometry_msgs/Pose goal 
+---
+# Result is the new pose after completing movement
+geometry_msgs/Pose new_pose
+---
+#
+# status on if the action is completed
+bool is_done

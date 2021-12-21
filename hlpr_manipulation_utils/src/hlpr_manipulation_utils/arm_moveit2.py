@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from logging import error
 import sys
 import os
 import copy
@@ -7,6 +8,7 @@ import rospy
 import moveit_commander
 import moveit_msgs.msg
 import moveit_msgs.srv
+from moveit_msgs.srv import GetStateValidityRequest, GetStateValidity
 import geometry_msgs.msg
 import std_msgs.msg
 import wpi_jaco_msgs.msg
@@ -75,6 +77,7 @@ class ArmMoveIt:
         ## Array of interfaces to single groups of joints.  
         ## At the moment, only a single arm interface is instantiated
         self.group = [moveit_commander.MoveGroupCommander("arm")]
+        print(self.group[0].get_end_effector_link())
 
         ## The name of the planner to use
         self.planner = default_planner
@@ -90,7 +93,7 @@ class ArmMoveIt:
         else:
             self.continuous_joints = ['shoulder_pan_joint','wrist_1_joint','wrist_2_joint','wrist_3_joint']
 
-    def get_IK(self, new_pose, root = None, group_id=0):
+    def get_IK(self, new_pose = None, root = None, group_id=0, avoid_collisions=False):
         """ Find the corresponding joint angles for an end effector pose
         
         Uses MoveIt! to compute the inverse kinematics for a given end
@@ -98,8 +101,8 @@ class ArmMoveIt:
 
         Parameters
         ----------
-        new_pose : geometry_msgs/Pose
-            the end effector pose
+        new_pose : geometry_msgs/PoseStamped 
+            the end effector pose (if none is provided, uses the current pose)
         root : string, optional
             the root link (if none is provided, uses the planning frame)
         group_id : int, optional
@@ -117,32 +120,33 @@ class ArmMoveIt:
         rospy.wait_for_service('compute_ik')
         compute_ik = rospy.ServiceProxy('compute_ik', moveit_msgs.srv.GetPositionIK)
 
-        wkPose = geometry_msgs.msg.PoseStamped()
-        if root is None:
-            wkPose.header.frame_id = self.group[group_id].get_planning_frame() # name:odom
-        else:
-            wkPose.header.frame_id = root
+        pose = (self.get_FK(root=root) if new_pose is None else new_pose)
+        pose = copy.deepcopy(pose)[0]
         
-        wkPose.header.stamp=rospy.Time.now()
-        wkPose.pose=new_pose
-
         msgs_request = moveit_msgs.msg.PositionIKRequest()
-        msgs_request.group_name = self.group[group_id].get_name() # name: arm
-        # msgs_request.robot_state = robot.get_current_state()
-        msgs_request.pose_stamped = wkPose
+        msgs_request.group_name = self.group[0].get_name()
+        msgs_request.pose_stamped = pose
+        msgs_request.robot_state.is_diff = True
         msgs_request.timeout.secs = 2
-        msgs_request.avoid_collisions = False
+        msgs_request.avoid_collisions = avoid_collisions
+        msgs_request.ik_link_names = ["j2s7s300_joint_1", "j2s7s300_joint_2", "j2s7s300_joint_3", "j2s7s300_joint_4",
+                        "j2s7s300_joint_5", "j2s7s300_joint_6", "j2s7s300_joint_7"]
 
+        # msgs_request.robot_state = self.robot.get_current_state()
         try:
             jointAngle=compute_ik(msgs_request)
-            ans=list(jointAngle.solution.joint_state.position[1:7])
+            ans=list(jointAngle.solution.joint_state.position)[2:9]
+            ans = self._simplify_joints(ans)
             if jointAngle.error_code.val == -31:
-                rospy.logerr('No IK solution')
+                print('No IK solution')
                 return None
+            if (jointAngle.error_code.val == -12 or jointAngle.error_code.val==-10) and avoid_collisions is True:
+                raise ValueError("Goal or current position is in collision")
             return ans
-        except rospy.ServiceException, e:
-            rospy.logerr("Service call failed: {}".format(e))
+        except rospy.ServiceException as e:
+            print("Service call failed: %s"%e)
 
+        
     def get_FK(self, root = None, state = None):
         """ Find the end effector pose for the current joint configuration
         
@@ -162,26 +166,26 @@ class ArmMoveIt:
         geometry_msgs/PoseStamped []
             the pose of the end effector
         """
-        if root is None:
-            root = self.group[0].get_pose_reference_frame()
-        
         rospy.wait_for_service('compute_fk')
         compute_fk = rospy.ServiceProxy('compute_fk', moveit_msgs.srv.GetPositionFK)
 
         header = std_msgs.msg.Header()
         header.frame_id = root
         header.stamp = rospy.Time.now()
-        fk_link_names = ['j2s7s300_ee_link']
-        if state is None:
-            robot_state = self.robot.get_current_state()
-        else:
-            robot_state = state
+        # THE CHANGE:
+        fk_link_names = ['j2s7s300_link_7']
+        robot_state = self.robot.get_current_state()
+        #print(robot_state.joint_state.position) 
+        #joints = dict(zip(robot_state.joint_state.name[2:9], robot_state.joint_state.position[2:9]))
+        #joints = self._simplify_joints(joints)
+        #print(robot_state.joint_state.position[2:9])
+        #robot_state.joint_state.position[2:9] = joints.values()
         try:
             reply=compute_fk(header,fk_link_names,robot_state)
             return reply.pose_stamped
 
         except rospy.ServiceException, e:
-            rospy.logerr("Service call failed: {}".format(e))
+            print "Service call failed: %s"%e
 
     def get_FK_wpi(self, joints = None):
         """ Find the end effector pose for a given joint configuration
@@ -210,6 +214,142 @@ class ArmMoveIt:
             return pose
         except rospy.ServiceException, e:
             rospy.logerr("Service call failed: {}".format(e))
+
+    def check_arm_collision(self, joints = None):
+        '''Gets whether a given joint of the arm pose is in collision 
+        with an object in the scene or not. If no joints
+        are provided, checks if the current pose is in collision.
+        
+        Parameters
+        ----------
+        joints : list or dictionary, optional
+            If not provided, uses current joint pos.
+        Returns
+        ----------
+        bool
+            True if arm is in collision. False otherwise.
+        '''
+        rospy.wait_for_service('/check_state_validity')
+        collison_service = rospy.ServiceProxy('/check_state_validity', GetStateValidity)
+
+        if joints is None:
+            joints = self.get_current_pose()
+
+        robot_state = self.state_from_joints(joints)
+
+        validityRequest = GetStateValidityRequest()
+        validityRequest.robot_state=robot_state
+        
+        collisions = collison_service(validityRequest)
+        
+        for i in range(len(collisions.contacts)):
+            body_1 = collisions.contacts[i].contact_body_1
+            body_2 = collisions.contacts[i].contact_body_2
+            if "j2" in body_1 or "j2" in body_2:
+                return True
+        
+        return False
+
+    def get_arm_collisions(self, joints = None):
+        '''Returns a list of collisions with the arm given a joint pose. 
+        If no joints are provided, checks if the current pose 
+        is in collision.
+        
+        Parameters
+        ----------
+        joints : list or dictionary, optional
+            If not provided, uses current joint pos.
+        Returns
+        ----------
+        list
+            list of tuples containing arm collisions.
+        '''
+        rospy.wait_for_service('/check_state_validity')
+        collison_service = rospy.ServiceProxy('/check_state_validity', GetStateValidity)
+
+        if joints is None:
+            joints = self.get_current_pose()
+
+        robot_state = self.state_from_joints(joints)
+
+        validityRequest = GetStateValidityRequest()
+        validityRequest.robot_state=robot_state
+        
+        collisions = collison_service(validityRequest)
+        
+        collision_list = []
+        for i in range(len(collisions.contacts)):
+            body_1 = collisions.contacts[i].contact_body_1
+            body_2 = collisions.contacts[i].contact_body_2
+            if "j2" in body_1 or "j2" in body_2:
+                collision_list.append((body_1, body_2))
+        
+        return collision_list
+
+    def check_robot_collision(self, joints = None):
+        '''Gets whether any part of the robot is currently in collision 
+        or not. Optionally can provide joints. 
+        
+        Parameters
+        ----------
+        joints : list or dictionary, optional
+            If not provided, uses current joint pos.
+        Returns
+        ----------
+        bool
+            True on success
+        '''
+        rospy.wait_for_service('/check_state_validity')
+        collison_service = rospy.ServiceProxy('/check_state_validity', GetStateValidity)
+
+        if joints is None:
+            joints = self.get_current_pose()
+
+        robot_state = self.state_from_joints(joints)
+
+        validityRequest = GetStateValidityRequest()
+        validityRequest.robot_state=robot_state
+        
+        collisions = collison_service(validityRequest)
+        
+        if len(collisions.contacts) == 0:
+            return False
+        return True
+
+    def get_robot_collisions(self, joints = None):
+        '''Returns a list of collisions with the robot given a joint pose. 
+        If no joints are provided, checks if the current pose 
+        is in collision.
+        
+        Parameters
+        ----------
+        joints : list or dictionary, optional
+            If not provided, uses current joint pos.
+        Returns
+        ----------
+        list
+            list of tuples containing robot collisions.
+        '''
+        rospy.wait_for_service('/check_state_validity')
+        collison_service = rospy.ServiceProxy('/check_state_validity', GetStateValidity)
+
+        if joints is None:
+            joints = self.get_current_pose()
+
+        robot_state = self.state_from_joints(joints)
+
+        validityRequest = GetStateValidityRequest()
+        validityRequest.robot_state=robot_state
+        
+        collisions = collison_service(validityRequest)
+        
+        collision_list = []
+        for i in range(len(collisions.contacts)):
+            body_1 = collisions.contacts[i].contact_body_1
+            body_2 = collisions.contacts[i].contact_body_2
+            collision_list.append((body_1, body_2))
+        
+        return collision_list
 
     def plan_joint_pos(self, target, starting_config=None, group_id=0):
         """ Plan a trajectory to reach a given joint configuration
@@ -750,7 +890,25 @@ class ArmMoveIt:
             return dict(zip(self.group[group_id].get_active_joints(),self._simplify_joints(self.group[group_id].get_current_joint_values(), group_id)))
         else:
             return dict(zip(self.group[group_id].get_active_joints(),self.group[group_id].get_current_joint_values())) 
+    
+    def get_planning_frame(self):
+        '''
+        Return
+        ---------
+        string
+            the frame used to initialize the planner
+        '''
+        return self.group[0].get_pose_reference_frame()
 
+    def get_eef_frame(self):
+        '''
+        Return
+        ---------
+        string
+            the frame used to initialize the end-effector link
+        '''
+        
+        return self.group[0].get_end_effector_link()
 
     def state_from_joints(self, joints):
         ''' Returns a RobotState object with given joint positions
@@ -856,7 +1014,7 @@ class ArmMoveIt:
             
             continuous_joint_indices = [joint_order.index(j) for j in self.continuous_joints]
 
-            for i in xrange(len(joints)):
+            for i in range(len(joints)):
                 a = joints[i]
                 if i in continuous_joint_indices:
                     simplified_joints.append(self._simplify_angle(a))
@@ -871,6 +1029,9 @@ class ArmMoveIt:
         ''' Copies the robot state (so it can be modified to plan from
             non-current joint configurations).'''
         ## output: a copy of the robot's current state
+        current_state = self.robot.get_current_state()
+        for name, state in zip(current_state.joint_state.name, current_state.joint_state.position):
+            print("%s %.2f" % (name, state))
         return copy.deepcopy(self.robot.get_current_state())
 
     def _merge_plans(self, plan_list, time_between=0.1):

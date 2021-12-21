@@ -103,7 +103,7 @@ class ArmMoveIt:
 
     try:
       jointAngle=compute_ik(msgs_request)
-      ans=list(jointAngle.solution.joint_state.position[1:7])
+      ans=list(jointAngle.solution.joint_state.position[2:9])
       if jointAngle.error_code.val == -31:
         print 'No IK solution'
         return None
@@ -120,7 +120,7 @@ class ArmMoveIt:
     header = std_msgs.msg.Header()
     header.frame_id = root
     header.stamp = rospy.Time.now()
-    fk_link_names = ['right_ee_link']
+    fk_link_names = ['j2s7s300_ee_link']
     robot_state = self.robot.get_current_state()    
     try:
       reply=compute_fk(header,fk_link_names,robot_state)
