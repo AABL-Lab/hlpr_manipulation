@@ -121,8 +121,11 @@ class ArmMoveIt:
         compute_ik = rospy.ServiceProxy('compute_ik', moveit_msgs.srv.GetPositionIK)
 
         pose = (self.get_FK(root=root) if new_pose is None else new_pose)
-        pose = copy.deepcopy(pose)[0]
-        
+        try:
+            pose = copy.deepcopy(pose)[0]
+        except:
+            pose = copy.deepcopy(pose)
+
         msgs_request = moveit_msgs.msg.PositionIKRequest()
         msgs_request.group_name = self.group[0].get_name()
         msgs_request.pose_stamped = pose

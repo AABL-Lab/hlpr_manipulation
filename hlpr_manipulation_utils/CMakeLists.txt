@@ -51,12 +51,14 @@ catkin_python_setup()
 add_message_files(
   FILES
   KTPlanDisplay.msg
+  RLTransitionPlusReward.msg
 )
 
 # Generate services in the 'srv' folder
 add_service_files(
   FILES
   FreezeFrame.srv
+  GetActionFromObs.srv
 )
 
 ## Generate actions in the 'action' folder
